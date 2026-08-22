@@ -14,6 +14,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 const MAX_STREAM_FRAME_BYTES: usize = 1024 * 1024;
+// Aggregate cap for buffering a non-streaming Responses compatibility result.
+const MAX_RESPONSES_AGGREGATE_BYTES: usize = 16 * 1024 * 1024;
+
+fn add_aggregate_bytes(total: &mut usize, chunk_len: usize) -> Result<(), String> {
+    *total = total.saturating_add(chunk_len);
+    if *total > MAX_RESPONSES_AGGREGATE_BYTES {
+        return Err(format!("Responses stream exceeded {MAX_RESPONSES_AGGREGATE_BYTES} byte aggregate limit"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Protocol {
@@ -53,31 +63,62 @@ struct TranslationOptions {
 /// Buffer a Responses SSE stream for a non-streaming downstream request.
 /// The upstream response is retained only until its terminal `response.completed`
 /// event, which is then normalized by the caller into a ChatCompletion JSON body.
+pub async fn collect_responses_chat_completion(
+    response: reqwest::Response,
+) -> Result<Value, String> {
+    collect_responses_completion(response).await
+}
+
+fn now_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn response_text_delta(value: &Value) -> Option<&str> {
+    (value.get("type").and_then(Value::as_str) == Some("response.output_text.delta"))
+        .then(|| value.get("delta").and_then(Value::as_str))
+        .flatten()
+}
+
 pub async fn collect_responses_completion(response: reqwest::Response) -> Result<Value, String> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
+    let mut aggregate_bytes = 0usize;
+    let mut output_text = String::new();
     while let Some(chunk) = stream.next().await {
-        buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
-        if buffer.len() > MAX_STREAM_FRAME_BYTES {
-            return Err("Responses stream exceeded 1 MiB while collecting non-stream response".into());
-        }
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        add_aggregate_bytes(&mut aggregate_bytes, chunk.len())?;
+        buffer.extend_from_slice(&chunk);
         while let Some((end, separator)) = next_event_boundary(&buffer) {
             let event = buffer.drain(..end).collect::<Vec<_>>();
             buffer.drain(..separator);
             let text = std::str::from_utf8(&event)
                 .map_err(|_| "upstream Responses SSE was not UTF-8")?;
-            let data = text.lines().filter_map(|line| line.strip_prefix("data:")
-                .map(str::trim_start)).collect::<Vec<_>>().join("\n");
-            if data.trim().is_empty() || data.trim() == "[DONE]" { continue; }
+            let Some(data) = sse_data_payload(text, Protocol::Responses)? else {
+                continue;
+            };
+            if data.trim() == "[DONE]" { continue; }
             let value: Value = serde_json::from_str(&data)
                 .map_err(|error| format!("decode upstream Responses SSE event: {error}"))?;
+            if let Some(delta) = response_text_delta(&value) {
+                output_text.push_str(delta);
+            }
             match value.get("type").and_then(Value::as_str) {
-                Some("response.completed") => return value.get("response").cloned()
-                    .ok_or_else(|| "response.completed event missing response".into()),
-                Some("response.failed") | Some("response.incomplete") | Some("error") => {
-                    return Err("upstream Responses stream ended without completion".into())
+                Some("response.completed") => {
+                    let mut completed = value.get("response").cloned()
+                        .ok_or_else(|| "response.completed event missing response".to_owned())?;
+                    if !output_text.is_empty() && completed.get("output_text").is_none() {
+                        completed["output_text"] = Value::String(output_text);
+                    }
+                    return Ok(completed);
                 }
-                _ => {}
+                Some("response.failed") | Some("response.incomplete") | Some("error") => {
+                    return Err("upstream Responses request failed or was incomplete".into())
+                }
+                Some(_) => {}
+                None => return Err("malformed upstream Responses event missing type".into()),
             }
         }
     }
@@ -239,8 +280,21 @@ async fn run_translation(
         }
         framer.finish()?;
     }
+    if protocol == Protocol::Responses && !state.responses.completed {
+        return Err("upstream Responses stream ended without response.completed".into());
+    }
     state.finish_if_needed(tx).await?;
     Ok(state.usage())
+}
+
+fn validate_responses_event(value: &Value) -> Result<(), String> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("response.failed") | Some("response.incomplete") | Some("error") => {
+            Err("upstream Responses request failed or was incomplete".into())
+        }
+        Some(_) => Ok(()),
+        None => Err("malformed upstream Responses event missing type".into()),
+    }
 }
 
 fn positive_duration(value: Option<f64>) -> Option<Duration> {
@@ -319,8 +373,24 @@ async fn process_sse_event(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
 ) -> Result<(), String> {
     let text = std::str::from_utf8(event).map_err(|_| "upstream SSE was not UTF-8")?;
+    let Some(data) = sse_data_payload(text, protocol)? else {
+        return Ok(());
+    };
+    if data.trim() == "[DONE]" {
+        return Ok(());
+    }
+    process_json_bytes(data.as_bytes(), protocol, state, tx).await
+}
+
+fn sse_data_payload(text: &str, protocol: Protocol) -> Result<Option<String>, String> {
     let mut data = String::new();
+    let mut has_non_comment = false;
     for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(':') {
+            continue;
+        }
+        has_non_comment = true;
         if let Some(value) = line.strip_prefix("data:") {
             if !data.is_empty() {
                 data.push('\n');
@@ -328,10 +398,13 @@ async fn process_sse_event(
             data.push_str(value.trim_start());
         }
     }
-    if data.trim().is_empty() || data.trim() == "[DONE]" {
-        return Ok(());
+    if data.trim().is_empty() {
+        if protocol == Protocol::Responses && has_non_comment {
+            return Err("malformed upstream Responses SSE event without data".into());
+        }
+        return Ok(None);
     }
-    process_json_bytes(data.as_bytes(), protocol, state, tx).await
+    Ok(Some(data))
 }
 
 async fn process_json_bytes(
@@ -346,6 +419,12 @@ async fn process_json_bytes(
     }
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("decode upstream stream event: {error}"))?;
+    if protocol == Protocol::Responses {
+        validate_responses_event(&value)?;
+        if value.get("type").and_then(Value::as_str) == Some("response.completed") {
+            state.responses.completed = true;
+        }
+    }
     let chunks = state.convert(protocol, &value);
     for chunk in chunks {
         send_wire(tx, &chunk, state.output_protocol).await?;
@@ -1518,6 +1597,66 @@ impl JsonObjectFramer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_sse_comments_are_valid_but_data_less_events_are_not() {
+        assert_eq!(sse_data_payload(": heartbeat\n", Protocol::Responses).unwrap(), None);
+        assert!(sse_data_payload("event: response.output_text.delta\n\n", Protocol::Responses).is_err());
+        assert!(sse_data_payload("data: {not-json}\n", Protocol::Responses).is_ok());
+    }
+
+    #[test]
+    fn responses_collector_preserves_output_text_deltas() {
+        assert_eq!(
+            response_text_delta(&json!({
+                "type":"response.output_text.delta",
+                "delta":"OK"
+            })),
+            Some("OK")
+        );
+        assert_eq!(
+            response_text_delta(&json!({"type":"response.reasoning.delta","delta":"hidden"})),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_parser_rejects_malformed_json_and_missing_type() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = StreamState::new_with_options("model", OutputProtocol::Chat, false);
+        assert!(process_sse_event(b"data: {not-json}", Protocol::Responses, &mut state, &tx)
+            .await
+            .is_err());
+        assert!(process_sse_event(b"data: {\"status\":\"in_progress\"}", Protocol::Responses, &mut state, &tx)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn responses_parser_rejects_failed_incomplete_error_and_missing_completion() {
+        let (tx, _rx) = mpsc::channel(8);
+        for event in [
+            r#"data: {"type":"response.failed"}"#,
+            r#"data: {"type":"response.incomplete"}"#,
+            r#"data: {"type":"error"}"#,
+        ] {
+            let mut state = StreamState::new_with_options("model", OutputProtocol::Chat, false);
+            assert!(process_sse_event(event.as_bytes(), Protocol::Responses, &mut state, &tx)
+                .await
+                .is_err());
+        }
+        let state = StreamState::new_with_options("model", OutputProtocol::Responses, false);
+        assert!(!state.responses.completed);
+    }
+
+    #[test]
+    fn responses_aggregate_limit_is_not_a_frame_limit() {
+        let mut total = 0;
+        assert!(add_aggregate_bytes(&mut total, MAX_STREAM_FRAME_BYTES).is_ok());
+        assert!(add_aggregate_bytes(&mut total, MAX_STREAM_FRAME_BYTES).is_ok());
+        let remaining_plus_one = MAX_RESPONSES_AGGREGATE_BYTES - total + 1;
+        assert!(add_aggregate_bytes(&mut total, remaining_plus_one).is_err());
+    }
 
     #[test]
     fn gemini_stream_maps_text_tools_and_usage() {

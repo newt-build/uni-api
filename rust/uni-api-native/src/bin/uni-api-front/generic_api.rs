@@ -1239,7 +1239,10 @@ fn build_attempt(
         .flatten();
     let (url, adapter, upstream_stream) = match engine.as_str() {
         "codex" if wire_path == "/v1/chat/completions" => {
-            payload = chat_to_responses(&payload, original_model)?;
+            // OpenAI-compatible clients such as Changedetection send
+            // `temperature: 0`; Codex's Responses endpoint rejects that field.
+            // Keep the omission scoped to this Codex-backed route.
+            payload = chat_to_responses(&payload, original_model, false)?;
             if !downstream_stream {
                 payload["stream"] = Value::Bool(true);
             }
@@ -1256,7 +1259,9 @@ fn build_attempt(
                     .to_ascii_lowercase()
                     .contains("/responses") =>
         {
-            payload = chat_to_responses(&payload, original_model)?;
+            // Other Responses-compatible providers retain OpenAI generation
+            // controls unless their own adapter explicitly normalizes them.
+            payload = chat_to_responses(&payload, original_model, true)?;
             (
                 responses_url(provider.base_url.as_ref()),
                 ResponseAdapter::ResponsesToChat,
@@ -2043,14 +2048,15 @@ async fn send_attempt(
     }
     if prepared.upstream_stream && !prepared.downstream_stream
         && prepared.adapter == ResponseAdapter::ResponsesToChat {
-        let upstream = provider_stream::collect_responses_completion(response).await
+        let response_value = provider_stream::collect_responses_chat_completion(response)
+            .await
             .map_err(|detail| AttemptFailure {
-                status: StatusCode::BAD_GATEWAY,
-                detail,
-                upstream_url: prepared.url.clone(),
-                response: None,
-            })?;
-        let normalized = responses_to_chat(&upstream, &prepared.original_model);
+            status: StatusCode::BAD_GATEWAY,
+            detail,
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?;
+        let normalized = responses_to_chat(&response_value, &prepared.original_model);
         let usage = usage(&normalized);
         let mut output = json_response(StatusCode::OK, normalized);
         output.headers_mut().insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
@@ -2550,7 +2556,11 @@ fn responses_input_to_chat_content(content: Option<&Value>) -> Value {
     )
 }
 
-fn chat_to_responses(input: &Value, original_model: &str) -> Result<Value, String> {
+fn chat_to_responses(
+    input: &Value,
+    original_model: &str,
+    preserve_temperature: bool,
+) -> Result<Value, String> {
     let root = input
         .as_object()
         .ok_or_else(|| "chat request body must be an object".to_owned())?;
@@ -2598,15 +2608,14 @@ fn chat_to_responses(input: &Value, original_model: &str) -> Result<Value, Strin
     output.insert("input".into(), Value::Array(items));
     output.insert("stream".into(), Value::Bool(false));
     output.insert("store".into(), Value::Bool(false));
-    for name in [
-        "temperature",
-        "top_p",
-        "reasoning",
-        "parallel_tool_calls",
-        "service_tier",
-    ] {
+    for name in ["top_p", "reasoning", "parallel_tool_calls", "service_tier"] {
         if let Some(value) = root.get(name) {
             output.insert(name.into(), value.clone());
+        }
+    }
+    if preserve_temperature {
+        if let Some(value) = root.get("temperature") {
+            output.insert("temperature".into(), value.clone());
         }
     }
     if let Some(tools) = root.get("tools").and_then(Value::as_array) {
@@ -2628,6 +2637,12 @@ fn chat_to_responses(input: &Value, original_model: &str) -> Result<Value, Strin
                     .collect(),
             ),
         );
+    }
+    if let Some(max_tokens) = root.get("max_tokens") {
+        if !preserve_temperature {
+            return Err("max_tokens is not supported for the Codex Responses route".into());
+        }
+        output.insert("max_output_tokens".into(), max_tokens.clone());
     }
     if let Some(choice) = root.get("tool_choice") {
         output.insert("tool_choice".into(), chat_tool_choice_to_responses(choice));
@@ -3562,6 +3577,18 @@ fn claude_content(content: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn response_text_fragment(value: &Value) -> Option<&str> {
+    if let Some(text) = value.as_str() {
+        return Some(text);
+    }
+    for key in ["text", "output_text", "value"] {
+        if let Some(fragment) = value.get(key).and_then(response_text_fragment) {
+            return Some(fragment);
+        }
+    }
+    None
+}
+
 fn responses_to_chat(value: &Value, model: &str) -> Value {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
@@ -3573,19 +3600,25 @@ fn responses_to_chat(value: &Value, model: &str) -> Value {
     {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
-                for content in item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(delta) = content
-                        .get("text")
-                        .or_else(|| content.get("output_text"))
-                        .and_then(Value::as_str)
-                    {
-                        text.push_str(delta);
+                match item.get("content") {
+                    Some(Value::String(content)) => text.push_str(content),
+                    Some(Value::Object(content)) => {
+                        if let Some(content_text) = content
+                            .get("text")
+                            .or_else(|| content.get("output_text"))
+                            .and_then(response_text_fragment)
+                        {
+                            text.push_str(content_text);
+                        }
                     }
+                    Some(Value::Array(contents)) => {
+                        for content in contents {
+                            if let Some(delta) = response_text_fragment(content) {
+                                text.push_str(delta);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             Some("function_call") => tool_calls.push(json!({
@@ -3594,6 +3627,15 @@ fn responses_to_chat(value: &Value, model: &str) -> Value {
                 "function":{"name":item.get("name").cloned().unwrap_or(Value::Null),"arguments":item.get("arguments").cloned().unwrap_or(Value::String("{}".into()))},
             })),
             _ => {}
+        }
+    }
+    // Some Responses providers expose the completed text only in the
+    // top-level `output_text` convenience field, while the structured
+    // `output` message may omit its content blocks. Preserve that text when
+    // adapting the buffered response back to Chat Completions.
+    if text.is_empty() {
+        if let Some(output_text) = value.get("output_text").and_then(Value::as_str) {
+            text.push_str(output_text);
         }
     }
     let has_tool_calls = !tool_calls.is_empty();
@@ -5163,13 +5205,34 @@ mod tests {
                 {"role":"user","content":"hello"}
             ],
             "max_tokens":42,
+            "temperature":0,
             "stream":true
         });
-        let output = chat_to_responses(&input, "gpt-upstream").unwrap();
+        let error = chat_to_responses(&input, "gpt-upstream", false).unwrap_err();
+        assert!(error.contains("max_tokens"));
+
+        let input_without_limit = json!({
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":true
+        });
+        let output = chat_to_responses(&input_without_limit, "gpt-upstream", false).unwrap();
         assert_eq!(output["model"], "gpt-upstream");
-        assert_eq!(output["max_output_tokens"], 42);
+        assert!(output.get("max_output_tokens").is_none());
+        assert!(output.get("temperature").is_none());
         assert_eq!(output["stream"], false);
-        assert_eq!(output["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(output["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn responses_compatible_providers_preserve_temperature() {
+        let input = json!({
+            "messages":[{"role":"user","content":"hello"}],
+            "temperature":0
+        });
+
+        let output = chat_to_responses(&input, "gpt-upstream", true).unwrap();
+
+        assert_eq!(output["temperature"], 0);
     }
 
     #[test]
@@ -5196,7 +5259,7 @@ mod tests {
             "tool_choice":{"type":"function","function":{"name":"now"}}
         });
 
-        let output = chat_to_responses(&input, "gpt-upstream").unwrap();
+        let output = chat_to_responses(&input, "gpt-upstream", true).unwrap();
 
         assert_eq!(output["tools"][0]["strict"], false);
         assert_eq!(output["tools"][1]["strict"], true);
@@ -5222,7 +5285,7 @@ mod tests {
             }
         });
 
-        let output = chat_to_responses(&input, "gpt-upstream").unwrap();
+        let output = chat_to_responses(&input, "gpt-upstream", true).unwrap();
 
         assert_eq!(
             output["tool_choice"],
@@ -5235,6 +5298,21 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn responses_to_chat_uses_top_level_output_text_when_output_blocks_are_empty() {
+        let response = responses_to_chat(
+            &json!({
+                "id":"resp-text",
+                "output":[{"type":"message","role":"assistant","content":[]}],
+                "output_text":"OK"
+            }),
+            "public-model",
+        );
+
+        assert_eq!(response["choices"][0]["message"]["content"], "OK");
+        assert_eq!(response["choices"][0]["finish_reason"], "stop");
     }
 
     #[test]
