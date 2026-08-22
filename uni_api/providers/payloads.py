@@ -2062,6 +2062,12 @@ async def get_codex_payload(request, engine, provider, api_key=None):
     if request.stream is not None:
         payload["stream"] = bool(request.stream)
 
+    # Chat Completions clients use ``max_tokens``; Codex Responses requires
+    # the equivalent ``max_output_tokens`` field.  Keep this mapping scoped to
+    # the chat compatibility adapter (the native Responses path has its own
+    # Codex validation rules below).
+    requested_max_tokens = request.max_tokens
+
     if request.tools and provider.get("tools") is not False:
         tools_out: list[dict] = []
         for tool in request.tools:
@@ -2129,6 +2135,8 @@ async def get_codex_payload(request, engine, provider, api_key=None):
 
     strip_codex_image_generation_defaults(payload, original_model)
     strip_unsupported_codex_payload_fields(payload)
+    if requested_max_tokens is not None:
+        payload["max_output_tokens"] = requested_max_tokens
     return url, headers, payload
 
 def build_azure_endpoint(base_url, deployment_id, api_version="2025-01-01-preview"):

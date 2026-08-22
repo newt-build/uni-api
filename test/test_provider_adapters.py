@@ -224,6 +224,37 @@ async def test_codex_adapter_builds_responses_request_from_chat_shape():
     assert upstream_request.payload["input"][0]["content"][0]["type"] == "input_text"
 
 
+async def test_codex_chat_adapter_maps_max_tokens_to_max_output_tokens():
+    request = RequestModel(
+        model="gpt-5.6-luna",
+        messages=[{"role": "user", "content": "hello"}],
+        stream=False,
+        max_tokens=123,
+    )
+    provider = {
+        "provider": "codex-a",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api": "upstream-key",
+        "engine": "codex",
+        "model": ["gpt-5.6-luna"],
+    }
+
+    upstream_request = await codex_adapter.build_request(
+        ProviderRequestContext(
+            request=request,
+            provider=provider,
+            engine="codex",
+            original_model="gpt-5.6-luna",
+            api_key="upstream-key",
+            endpoint="/v1/chat/completions",
+        )
+    )
+
+    assert upstream_request.payload["stream"] is False
+    assert upstream_request.payload["max_output_tokens"] == 123
+    assert "max_tokens" not in upstream_request.payload
+
+
 @pytest.mark.parametrize(
     ("requested_tier", "expected_tier"),
     [

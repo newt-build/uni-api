@@ -87,6 +87,12 @@ async def prepare_provider_request(
         )
     )
 
+    # Codex Responses requires an SSE upstream even when the OpenAI-compatible
+    # caller requested a buffered chat completion. The runtime collects that
+    # stream and returns JSON without changing the caller-visible flag.
+    if engine == "codex" and request.stream is False and endpoint in (None, "/v1/chat/completions"):
+        upstream_request.payload["stream"] = True
+
     headers = dict(upstream_request.headers)
     if engine == "codex" and codex_account_id:
         headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))

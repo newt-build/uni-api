@@ -50,6 +50,40 @@ struct TranslationOptions {
     timeouts: StreamTimeouts,
 }
 
+/// Buffer a Responses SSE stream for a non-streaming downstream request.
+/// The upstream response is retained only until its terminal `response.completed`
+/// event, which is then normalized by the caller into a ChatCompletion JSON body.
+pub async fn collect_responses_completion(response: reqwest::Response) -> Result<Value, String> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+        if buffer.len() > MAX_STREAM_FRAME_BYTES {
+            return Err("Responses stream exceeded 1 MiB while collecting non-stream response".into());
+        }
+        while let Some((end, separator)) = next_event_boundary(&buffer) {
+            let event = buffer.drain(..end).collect::<Vec<_>>();
+            buffer.drain(..separator);
+            let text = std::str::from_utf8(&event)
+                .map_err(|_| "upstream Responses SSE was not UTF-8")?;
+            let data = text.lines().filter_map(|line| line.strip_prefix("data:")
+                .map(str::trim_start)).collect::<Vec<_>>().join("\n");
+            if data.trim().is_empty() || data.trim() == "[DONE]" { continue; }
+            let value: Value = serde_json::from_str(&data)
+                .map_err(|error| format!("decode upstream Responses SSE event: {error}"))?;
+            match value.get("type").and_then(Value::as_str) {
+                Some("response.completed") => return value.get("response").cloned()
+                    .ok_or_else(|| "response.completed event missing response".into()),
+                Some("response.failed") | Some("response.incomplete") | Some("error") => {
+                    return Err("upstream Responses stream ended without completion".into())
+                }
+                _ => {}
+            }
+        }
+    }
+    Err("upstream Responses stream ended without response.completed".into())
+}
+
 pub fn translate(
     response: reqwest::Response,
     protocol: Protocol,

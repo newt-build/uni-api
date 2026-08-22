@@ -323,6 +323,94 @@ def test_process_request_uses_http1_client_for_codex_chat(monkeypatch):
     asyncio.run(run_test())
 
 
+def test_process_request_collects_nonstream_codex_chat_completion(monkeypatch):
+    class DummyClient:
+        pass
+
+    class DummyClientManager:
+        @contextlib.asynccontextmanager
+        async def get_client(self, base_url, proxy=None, http2=None):
+            _ = (base_url, proxy, http2)
+            yield DummyClient()
+
+    async def fake_fetch_response(*_args, **_kwargs):
+        raise AssertionError("non-stream transport must not be used for Codex chat")
+
+    async def fake_fetch_response_stream(
+        _client, _url, _headers, payload, _engine, _model, _timeout,
+        response_headers_sink=None,
+    ):
+        assert payload["stream"] is True
+        assert payload["max_output_tokens"] == 42
+        if response_headers_sink is not None:
+            response_headers_sink({"x-upstream": "test"})
+        yield (
+            'data: {"id":"chatcmpl-test","object":"chat.completion.chunk",'
+            '"created":1,"model":"gpt-5.6-luna","choices":[{'
+            '"index":0,"delta":{"role":"assistant","content":"ok"},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: {"id":"chatcmpl-test","object":"chat.completion.chunk",'
+            '"created":1,"model":"gpt-5.6-luna","choices":[{'
+            '"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        )
+        yield "data: [DONE]\n\n"
+
+    client_manager = DummyClientManager()
+    monkeypatch.setattr(main, "fetch_response", fake_fetch_response)
+    monkeypatch.setattr(main, "fetch_response_stream", fake_fetch_response_stream)
+    main.app.state.client_manager = client_manager
+    main.app.state.config = {"preferences": {}}
+    main.app.state.error_triggers = []
+
+    async def run_test():
+        token = main.request_info.set(
+            {
+                "request_id": "req-codex-chat-nonstream",
+                "api_key": "sk-test",
+                "first_response_time": None,
+                "success": False,
+                "provider": None,
+            }
+        )
+        try:
+            response = await main.process_request(
+                RequestModel(
+                    model="gpt-5.6-luna",
+                    messages=[{"role": "user", "content": "hello"}],
+                    stream=False,
+                    max_tokens=42,
+                ),
+                {
+                    "provider": "codex-a",
+                    "engine": "codex",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "api": "change-me",
+                    "model": ["gpt-5.6-luna"],
+                    "_model_dict_cache": {"gpt-5.6-luna": "gpt-5.6-luna"},
+                    "preferences": {},
+                    "tools": True,
+                },
+                BackgroundTasks(),
+                endpoint="/v1/chat/completions",
+                role="admin",
+                timeout_value=30,
+                provider_api_key_raw="change-me",
+            )
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+            body = b"".join(chunks)
+            payload = json.loads(body)
+            assert response.media_type == "application/json"
+            assert payload["object"] == "chat.completion"
+            assert payload["choices"][0]["message"]["content"] == "ok"
+        finally:
+            main.request_info.reset(token)
+
+    asyncio.run(run_test())
+
 def test_model_request_handler_passes_selected_provider_key(monkeypatch):
     provider_name = "provider-a"
 

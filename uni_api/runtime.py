@@ -4022,8 +4022,10 @@ async def process_request(
 
     try:
         async with app.state.client_manager.get_client(url, proxy, http2=False if engine == "codex" else None) as client:
-            downstream_stream = bool(getattr(request, "stream", None))
-            force_collect_codex_stream = engine == "codex" and not downstream_stream and endpoint is None
+            downstream_stream = bool(getattr(http_request.state, "client_requested_stream", getattr(request, "stream", None))) if http_request is not None else bool(getattr(request, "stream", None))
+            # Codex requires an SSE upstream; buffer it for every non-streaming
+            # OpenAI-compatible caller regardless of the route alias.
+            force_collect_codex_stream = engine == "codex" and not downstream_stream
             defer_channel_result = False
             upstream_response_headers: dict[str, str] = {}
 
@@ -11390,6 +11392,9 @@ async def chat_completions_route(
     api_index: int = Depends(verify_api_key),
 ):
     await _drop_parsed_request_caches(http_request)
+    if request.stream is False:
+        http_request.state.client_requested_stream = False
+        request.stream = True
     return await chat_completions_response(
         model_handler=model_handler,
         http_request=http_request,

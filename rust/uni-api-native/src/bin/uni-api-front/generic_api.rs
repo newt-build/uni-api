@@ -1141,7 +1141,7 @@ fn build_attempt(
             .and_then(|payload| payload.get("stream"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let provider_stream = downstream_stream;
+    let provider_stream = downstream_stream || (engine == "codex" && path == "/v1/chat/completions");
     let chat_stream_include_usage = path == "/v1/chat/completions"
         && input
             .payload
@@ -1240,6 +1240,9 @@ fn build_attempt(
     let (url, adapter, upstream_stream) = match engine.as_str() {
         "codex" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_responses(&payload, original_model)?;
+            if !downstream_stream {
+                payload["stream"] = Value::Bool(true);
+            }
             (
                 responses_url(provider.base_url.as_ref()),
                 ResponseAdapter::ResponsesToChat,
@@ -2038,6 +2041,27 @@ async fn send_attempt(
             upstream_url: prepared.url,
         });
     }
+    if prepared.upstream_stream && !prepared.downstream_stream
+        && prepared.adapter == ResponseAdapter::ResponsesToChat {
+        let upstream = provider_stream::collect_responses_completion(response).await
+            .map_err(|detail| AttemptFailure {
+                status: StatusCode::BAD_GATEWAY,
+                detail,
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+        let normalized = responses_to_chat(&upstream, &prepared.original_model);
+        let usage = usage(&normalized);
+        let mut output = json_response(StatusCode::OK, normalized);
+        output.headers_mut().insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        return Ok(AttemptSuccess {
+            response: output,
+            status: StatusCode::OK,
+            usage,
+            usage_completion: None,
+            upstream_url: prepared.url,
+        });
+    }
     if prepared.upstream_stream {
         let protocol = match prepared.adapter {
             ResponseAdapter::ResponsesToChat => StreamProtocol::Responses,
@@ -2574,9 +2598,6 @@ fn chat_to_responses(input: &Value, original_model: &str) -> Result<Value, Strin
     output.insert("input".into(), Value::Array(items));
     output.insert("stream".into(), Value::Bool(false));
     output.insert("store".into(), Value::Bool(false));
-    if let Some(max_tokens) = root.get("max_tokens") {
-        output.insert("max_output_tokens".into(), max_tokens.clone());
-    }
     for name in [
         "temperature",
         "top_p",
