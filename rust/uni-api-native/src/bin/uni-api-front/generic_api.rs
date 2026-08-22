@@ -2639,10 +2639,14 @@ fn chat_to_responses(
         );
     }
     if let Some(max_tokens) = root.get("max_tokens") {
-        if !preserve_temperature {
-            return Err("max_tokens is not supported for the Codex Responses route".into());
+        if preserve_temperature {
+            output.insert("max_output_tokens".into(), max_tokens.clone());
         }
-        output.insert("max_output_tokens".into(), max_tokens.clone());
+        // Codex Responses rejects both Chat's `max_tokens` and Responses'
+        // `max_output_tokens`. Omit the incompatible client default on this
+        // one adapter so OpenAI-compatible clients (including Changedetection)
+        // can use the same tier alias; gateway/provider response limits still
+        // bound the request.
     }
     if let Some(choice) = root.get("tool_choice") {
         output.insert("tool_choice".into(), chat_tool_choice_to_responses(choice));
@@ -5208,8 +5212,8 @@ mod tests {
             "temperature":0,
             "stream":true
         });
-        let error = chat_to_responses(&input, "gpt-upstream", false).unwrap_err();
-        assert!(error.contains("max_tokens"));
+        let output = chat_to_responses(&input, "gpt-upstream", false).unwrap();
+        assert!(output.get("max_output_tokens").is_none());
 
         let input_without_limit = json!({
             "messages":[{"role":"user","content":"hello"}],
