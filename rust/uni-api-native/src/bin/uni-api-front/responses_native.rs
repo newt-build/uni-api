@@ -1308,6 +1308,7 @@ impl NativeRoute {
             self.last_provider.as_deref(),
             &self.endpoint,
             self.auto_retry(),
+            self.route_has_alternatives(),
         );
         let status = policy.status;
         self.last_status = status;
@@ -1682,6 +1683,10 @@ impl NativeRoute {
                 "rust_responses_data_plane": true,
             })
         );
+    }
+
+    fn route_has_alternatives(&self) -> bool {
+        self.providers.len() > 1
     }
 
     fn auto_retry(&self) -> bool {
@@ -2650,6 +2655,27 @@ pub(crate) fn apply_overrides(
     }
 }
 
+pub(crate) fn sanitize_openai_compat_payload(root: &mut Map<String, Value>, provider: &Provider) {
+    let map_developer_to_system = provider
+        .preferences
+        .get("map_developer_to_system")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !map_developer_to_system {
+        return;
+    }
+    let Some(messages) = root.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        if let Some(message) = message.as_object_mut() {
+            if message.get("role").and_then(Value::as_str) == Some("developer") {
+                message.insert("role".into(), Value::String("system".into()));
+            }
+        }
+    }
+}
+
 fn apply_override_section(
     root: &mut Map<String, Value>,
     section: &Map<String, Value>,
@@ -3325,6 +3351,7 @@ pub(crate) fn classify_provider_failure(
     provider: Option<&Provider>,
     endpoint: &str,
     auto_retry: bool,
+    route_has_alternatives: bool,
 ) -> ProviderFailurePolicy {
     let status = remap_provider_status(original_status, detail);
     let codex_model_unsupported = status == 400
@@ -3339,7 +3366,15 @@ pub(crate) fn classify_provider_failure(
         && provider.is_some_and(|provider| is_azure_provider(&provider.base_url));
     ProviderFailurePolicy {
         status,
-        retryable: auto_retry && (!request_scoped || codex_model_unsupported || azure_request),
+        // A deterministic upstream 400/413 (for example a parameter the target
+        // model does not accept yet, or a context/payload limit specific to one
+        // model) must not terminate the whole semantic tier: fail over to the
+        // remaining same-tier providers when available.
+        retryable: auto_retry
+            && (!request_scoped
+                || codex_model_unsupported
+                || azure_request
+                || (matches!(status, 400 | 413) && route_has_alternatives)),
         request_scoped,
         force_quota_cooldown: codex_model_unsupported,
     }
@@ -4029,6 +4064,7 @@ mod tests {
                 Some(&base_provider),
                 "/v1/chat/completions",
                 true,
+                false,
             );
             assert!(policy.retryable, "status {status} should fail over");
             assert!(
@@ -4043,7 +4079,8 @@ mod tests {
                 "invalid request",
                 Some(&base_provider),
                 "/v1/chat/completions",
-                true
+                true,
+                false,
             )
             .retryable
         );
@@ -4053,7 +4090,8 @@ mod tests {
                 "payload too large",
                 Some(&base_provider),
                 "/v1/chat/completions",
-                true
+                true,
+                false,
             )
             .retryable
         );
@@ -4063,7 +4101,8 @@ mod tests {
                 "upstream failure",
                 Some(&base_provider),
                 "/v1/chat/completions",
-                false
+                false,
+                false,
             )
             .retryable
         );
@@ -4073,7 +4112,44 @@ mod tests {
             Some(&base_provider),
             "/v1/responses",
             true,
+            false,
         ).retryable);
+
+        // A deterministic upstream 400 fails over to same-tier alternatives.
+        assert!(
+            classify_provider_failure(
+                400,
+                "invalid request",
+                Some(&base_provider),
+                "/v1/chat/completions",
+                true,
+                true,
+            )
+            .retryable
+        );
+        assert!(
+            classify_provider_failure(
+                413,
+                "payload too large",
+                Some(&base_provider),
+                "/v1/chat/completions",
+                true,
+                true,
+            )
+            .retryable
+        );
+        // Without auto-retry a 400 never fails over.
+        assert!(
+            !classify_provider_failure(
+                400,
+                "invalid request",
+                Some(&base_provider),
+                "/v1/chat/completions",
+                false,
+                true,
+            )
+            .retryable
+        );
 
         let pricing = classify_provider_failure(
             400,
@@ -4081,6 +4157,7 @@ mod tests {
             Some(&base_provider),
             "/v1/chat/completions",
             true,
+            false,
         );
         assert_eq!(pricing.status, 502);
         assert!(pricing.retryable);
@@ -4091,6 +4168,7 @@ mod tests {
             Some(&base_provider),
             "/v1/responses",
             true,
+            false,
         );
         assert!(codex.retryable);
         assert!(codex.force_quota_cooldown);
@@ -4101,6 +4179,7 @@ mod tests {
                 Some(&base_provider),
                 "/v1/chat/completions",
                 true,
+                false,
             )
             .retryable
         );
@@ -4114,7 +4193,8 @@ mod tests {
                 "provider validation",
                 Some(&azure),
                 "/v1/chat/completions",
-                true
+                true,
+                false,
             )
             .retryable
         );
@@ -4124,7 +4204,8 @@ mod tests {
                 "provider validation",
                 Some(&azure),
                 "/v1/chat/completions",
-                true
+                true,
+                false,
             )
             .retryable
         );

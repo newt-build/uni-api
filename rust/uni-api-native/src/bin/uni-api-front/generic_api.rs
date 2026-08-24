@@ -28,7 +28,7 @@ use crate::request_spool::{SpoolObservation, StoredBody};
 use crate::resources::MemoryReservation;
 use crate::responses_native::{
     apply_overrides, classify_provider_failure, compute_retry_count, extract_api_key, request_id,
-    FailedRoute, Provider, ProviderKeySelection, CODEX_USER_AGENT,
+    sanitize_openai_compat_payload, FailedRoute, Provider, ProviderKeySelection, CODEX_USER_AGENT,
 };
 
 const ALPHA_SEARCH_ENDPOINT: &str = "/v1/alpha/search";
@@ -443,6 +443,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                     Some(&provider),
                     &path,
                     auto_retry,
+                    resolved.providers.len() > 1,
                 );
                 failure.status =
                     StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1481,6 +1482,7 @@ fn build_attempt(
             sanitize_alpha_search_payload(root);
         } else {
             apply_overrides(root, provider, request_model);
+            sanitize_openai_compat_payload(root, provider);
             if path == "/v1/responses/compact" {
                 root.remove("store");
             }
@@ -5152,6 +5154,7 @@ fn unix_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn test_provider(engine: &str, base_url: &str) -> Provider {
         Provider {
@@ -5763,6 +5766,36 @@ mod tests {
             "https://github.com/yym68686/uni-api"
         );
         assert_eq!(headers["x-title"], "Uni API");
+    }
+
+    #[test]
+    fn openai_compat_sanitize_maps_developer_roles_when_enabled() {
+        let mut provider = test_provider("openai", "https://opencode.ai/zen/go/v1/chat/completions");
+        let mut preferences = Map::new();
+        preferences.insert("map_developer_to_system".into(), json!(true));
+        provider.preferences = Arc::new(preferences);
+
+        let mut payload = json!({
+            "model": "tier-2",
+            "messages": [
+                {"role": "developer", "content": "be nice"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        sanitize_openai_compat_payload(payload.as_object_mut().unwrap(), &provider);
+        assert_eq!(payload["messages"][0]["role"], "system");
+        assert_eq!(payload["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn openai_compat_sanitize_is_noop_without_preference() {
+        let provider = test_provider("openai", "https://example.com/v1/chat/completions");
+        let mut payload = json!({
+            "model": "tier-2",
+            "messages": [{"role": "developer", "content": "be nice"}]
+        });
+        sanitize_openai_compat_payload(payload.as_object_mut().unwrap(), &provider);
+        assert_eq!(payload["messages"][0]["role"], "developer");
     }
 
     #[test]
