@@ -4239,3 +4239,9 @@ mod tests {
         assert!(route.final_emitted);
     }
 }
+    if provider.base_url.contains("opencode.ai") {
+        headers.insert(
+            "x-opencode-session".into(),
+            header_or(incoming, "x-opencode-session", request_id),
+        );
+    }

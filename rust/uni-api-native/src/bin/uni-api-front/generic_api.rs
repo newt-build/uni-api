@@ -2340,6 +2340,18 @@ fn provider_headers(
         headers.insert("x-request-id", value.clone());
         headers.insert("x-caller-request-id", value);
     }
+    if provider.base_url.to_ascii_lowercase().contains("opencode.ai") {
+        let session = incoming
+            .get("x-opencode-session")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(request_id);
+        headers.insert(
+            "x-opencode-session",
+            HeaderValue::from_str(session)
+                .map_err(|_| "OpenCode session is not a valid header value".to_owned())?,
+        );
+    }
     if stream {
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
     }

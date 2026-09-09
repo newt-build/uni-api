@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
+import uuid
 
 from fastapi import HTTPException
 
@@ -10,6 +11,39 @@ from uni_api.providers.base import ProviderRequestContext
 from uni_api.providers.header_passthrough import apply_provider_preference_headers
 from uni_api.providers.payloads import force_codex_client_headers
 from uni_api.providers.registry import ProviderRegistry
+
+
+def ensure_opencode_session_header(headers: dict[str, Any], http_request: Any | None = None) -> None:
+    """Ensure OpenCode Go receives its required session-affinity header.
+
+    Prefer an explicitly supplied OpenCode/session identifier, then the
+    caller's request id.  This is metadata only: never derive it from a
+    credential or request body.  UniAPI uses the request id as a bounded
+    per-request fallback when Hermes does not provide a session id.
+    """
+    for name in ("x-opencode-session", "x-session-id", "session_id", "Session_id", "x-request-id"):
+        value = headers.get(name)
+        if value:
+            headers.setdefault("x-opencode-session", str(value))
+            return
+    request_headers = getattr(http_request, "headers", None) if http_request is not None else None
+    if request_headers is not None:
+        for name in ("x-opencode-session", "x-session-id", "session_id", "Session_id", "x-request-id"):
+            value = request_headers.get(name)
+            if value:
+                headers.setdefault("x-opencode-session", str(value))
+                return
+    state = getattr(http_request, "state", None) if http_request is not None else None
+    if state is not None:
+        existing = getattr(state, "uni_api_opencode_session", None)
+        if existing:
+            headers.setdefault("x-opencode-session", str(existing))
+            return
+        generated = uuid.uuid4().hex
+        setattr(state, "uni_api_opencode_session", generated)
+        headers.setdefault("x-opencode-session", generated)
+        return
+    headers.setdefault("x-opencode-session", uuid.uuid4().hex)
 
 
 @dataclass(frozen=True)
@@ -99,6 +133,8 @@ async def prepare_provider_request(
     apply_provider_preference_headers(headers, provider, http_request=http_request)
     if engine == "codex":
         force_codex_client_headers(headers)
+    elif provider["provider"].startswith("opencode-go"):
+        ensure_opencode_session_header(headers, http_request=http_request)
 
     return PreparedProviderRequest(
         original_model=original_model,
