@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::Request;
@@ -60,6 +60,7 @@ pub async fn handle(
         }
         (&Method::GET, "/v1/stats") => Some(stats_response(state, uri, headers).await),
         (&Method::GET, "/v1/token_usage") => Some(token_usage_response(state, uri, headers).await),
+        (&Method::GET, "/v1/provider_usage") => Some(provider_usage_response(state, headers).await),
         (&Method::GET, "/v1/channel_key_rankings") => {
             Some(channel_rankings_response(state, uri, headers).await)
         }
@@ -377,6 +378,147 @@ async fn token_usage_response(state: &AppState, uri: &Uri, headers: &HeaderMap) 
     }
 }
 
+async fn provider_usage_response(state: &AppState, headers: &HeaderMap) -> Response<Body> {
+    if let Err(response) = require_admin(state, headers).await {
+        return response;
+    }
+    let observed_at = unix_seconds();
+    let unavailable = |reason: &str| {
+        json_response(
+            StatusCode::OK,
+            json!({"subscriptions":[{
+                "subscription_key":"codex/oauth",
+                "status":"unavailable",
+                "observed_at":observed_at,
+                "fresh_until":Value::Null,
+                "windows":[],
+                "reason":reason,
+            }]}),
+        )
+    };
+    let Some(snapshot) = state.native_responses_config.snapshot().await else {
+        return unavailable("configuration_unavailable");
+    };
+    let Some(provider) = snapshot
+        .providers
+        .iter()
+        .find(|provider| provider.engine.eq_ignore_ascii_case("codex"))
+    else {
+        return unavailable("provider_not_configured");
+    };
+    let Some(raw_key) = provider.api_keys.first() else {
+        return unavailable("credential_reference_unavailable");
+    };
+    let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
+    let auth = match state.codex_oauth.resolve(raw_key, proxy).await {
+        Ok(auth) => auth,
+        Err(_) => return unavailable("oauth_refresh_failed"),
+    };
+    let client = match state
+        .upstream_client(proxy, true, Some(Duration::from_secs(10)))
+        .await
+    {
+        Ok(client) => client,
+        Err(_) => return unavailable("transport_unavailable"),
+    };
+    let mut request = client
+        .get("https://chatgpt.com/backend-api/wham/usage")
+        .bearer_auth(auth.bearer)
+        .header("accept", "application/json")
+        .timeout(Duration::from_secs(30));
+    if let Some(account_id) = auth.account_id {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(_) => return unavailable("transport_error"),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return unavailable(match status.as_u16() {
+            401 | 403 => "upstream_auth_rejected",
+            429 => "upstream_rate_limited",
+            _ => "upstream_unavailable",
+        });
+    }
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(_) => return unavailable("upstream_payload_invalid"),
+    };
+    let windows = normalize_codex_usage(&payload);
+    if windows.is_empty() {
+        return unavailable("upstream_payload_unsupported");
+    }
+    json_response(
+        StatusCode::OK,
+        json!({"subscriptions":[{
+            "subscription_key":"codex/oauth",
+            "status":"observed",
+            "observed_at":observed_at,
+            "fresh_until":observed_at.saturating_add(300),
+            "windows":windows,
+        }]}),
+    )
+}
+
+fn normalize_codex_usage(payload: &Value) -> Vec<Value> {
+    let mut windows = Vec::new();
+    if let Some(rate_limit) = payload.get("rate_limit").and_then(Value::as_object) {
+        for (source_key, window) in [
+            ("primary_window", "rolling"),
+            ("secondary_window", "weekly"),
+        ] {
+            let Some(value) = rate_limit.get(source_key).and_then(Value::as_object) else {
+                continue;
+            };
+            let used_percent = value
+                .get("used_percent")
+                .or_else(|| value.get("percent"))
+                .filter(|value| value.is_number());
+            let reset_at = value
+                .get("reset_at")
+                .or_else(|| value.get("resets_at"))
+                .or_else(|| value.get("resetsAt"))
+                .filter(|value| value.is_number() || value.is_string());
+            if used_percent.is_none() && reset_at.is_none() {
+                continue;
+            }
+            windows.push(json!({
+                "window":window,
+                "used_percent":used_percent.cloned().unwrap_or(Value::Null),
+                "reset_at":reset_at.cloned().unwrap_or(Value::Null),
+            }));
+        }
+    }
+    if windows.is_empty() {
+        if let Some(usage) = payload.get("usage").and_then(Value::as_object) {
+            for window in ["rolling", "5h", "weekly", "monthly"] {
+                let Some(value) = usage.get(window).and_then(Value::as_object) else {
+                    continue;
+                };
+                let used_percent = value
+                    .get("used_percent")
+                    .or_else(|| value.get("percent"))
+                    .filter(|value| value.is_number());
+                let reset_at = value
+                    .get("reset_at")
+                    .or_else(|| value.get("resets_at"))
+                    .or_else(|| value.get("resetsAt"))
+                    .filter(|value| value.is_number() || value.is_string());
+                if used_percent.is_none() && reset_at.is_none() {
+                    continue;
+                }
+                windows.push(json!({
+                    "window":window,
+                    "used_percent":used_percent.cloned().unwrap_or(Value::Null),
+                    "reset_at":reset_at.cloned().unwrap_or(Value::Null),
+                }));
+            }
+        }
+    }
+    windows
+}
+
 async fn channel_rankings_response(
     state: &AppState,
     uri: &Uri,
@@ -516,6 +658,7 @@ fn openapi_document() -> Value {
         ("get", "/v1/assets/{asset_id}"),
         ("get", "/v1/stats"),
         ("get", "/v1/token_usage"),
+        ("get", "/v1/provider_usage"),
     ] {
         paths.entry(path).or_insert_with(|| json!({}))[method] =
             json!({"responses":{"200":{"description":"OK"}}});
@@ -636,5 +779,34 @@ mod tests {
         assert_eq!(fallback["input_modalities"], json!(["text", "image"]));
         assert!(is_codex_catalog_model("deepseek-chat"));
         assert!(!is_codex_catalog_model("text-embedding-3-large"));
+    }
+
+    #[test]
+    fn normalizes_codex_usage_without_raw_or_secret_fields() {
+        let windows = normalize_codex_usage(&json!({
+            "plan_type":"plus",
+            "access_token":"must-not-escape",
+            "rate_limit":{
+                "primary_window":{"used_percent":42,"reset_at":1_700_000_000,"raw":"hidden"},
+                "secondary_window":{"used_percent":7,"reset_at":"2026-09-22T00:00:00Z"}
+            }
+        }));
+        assert_eq!(
+            windows,
+            vec![
+                json!({"window":"rolling","used_percent":42,"reset_at":1_700_000_000}),
+                json!({"window":"weekly","used_percent":7,"reset_at":"2026-09-22T00:00:00Z"}),
+            ]
+        );
+        let encoded = serde_json::to_string(&windows).unwrap();
+        assert!(!encoded.contains("access_token"));
+        assert!(!encoded.contains("must-not-escape"));
+        assert!(!encoded.contains("raw"));
+    }
+
+    #[test]
+    fn unsupported_codex_usage_fails_closed() {
+        assert!(normalize_codex_usage(&json!({"usage":{"rolling":{}}})).is_empty());
+        assert!(normalize_codex_usage(&json!({"token":"secret"})).is_empty());
     }
 }
