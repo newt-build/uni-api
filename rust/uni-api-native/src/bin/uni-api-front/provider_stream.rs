@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -60,13 +61,121 @@ struct TranslationOptions {
     timeouts: StreamTimeouts,
 }
 
+/// Keep a log field bounded and single-line so gateway logs stay one JSON
+/// object per line.
+pub(crate) fn bounded_log_field(value: &str, max: usize) -> String {
+    value.chars().take(max).collect::<String>().replace(['\n', '\r'], " ")
+}
+
+/// Compact, non-sensitive summary of an upstream Responses failure event.
+/// Error metadata only: prompt, completion and reasoning content are never read.
+fn responses_failure_detail(value: &Value) -> String {
+    let event_type = value.get("type").and_then(Value::as_str).unwrap_or("unknown");
+    let response = value.get("response");
+    let error = response
+        .and_then(|value| value.get("error"))
+        .or_else(|| value.get("error"));
+    let error_type = error.and_then(|value| value.get("type")).and_then(Value::as_str);
+    let error_code = error.and_then(|value| value.get("code")).and_then(Value::as_str);
+    let message = error.and_then(|value| value.get("message")).and_then(Value::as_str);
+    let incomplete = response
+        .and_then(|value| value.get("incomplete_details"))
+        .and_then(|value| value.get("reason"))
+        .and_then(Value::as_str);
+    let mut detail = format!("upstream Responses request failed or was incomplete ({event_type}");
+    if let Some(value) = error_type {
+        detail.push_str(&format!(" type={value}"));
+    }
+    if let Some(value) = error_code {
+        detail.push_str(&format!(" code={value}"));
+    }
+    if let Some(value) = incomplete {
+        detail.push_str(&format!(" reason={value}"));
+    }
+    if let Some(value) = message {
+        detail.push_str(&format!(" message={}", bounded_log_field(value, 400)));
+    }
+    detail.push(')');
+    detail
+}
+
+fn log_upstream_stream_failure(
+    model: &str,
+    detail: &str,
+    payload: Option<&Value>,
+    output_protocol: OutputProtocol,
+) {
+    eprintln!(
+        "{}",
+        json!({
+            "event_type":"rust_upstream_stream_failure",
+            "model":model,
+            "output_protocol":if output_protocol == OutputProtocol::Chat { "chat" } else { "responses" },
+            "reason":bounded_log_field(detail, 600),
+            "upstream_event":payload.map(|value| bounded_log_field(&value.to_string(), 800)),
+        })
+    );
+}
+
+/// Resolved as soon as the first upstream stream event has been validated, so
+/// the caller can fail over to another same-tier provider instead of committing
+/// the client to a stream that already failed. Before this resolves, nothing
+/// meaningful has been written to the client for a Chat downstream, which is
+/// what makes a retry safe.
+struct StartGate {
+    resolved: bool,
+    logged_failure: bool,
+    tx: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+impl Default for StartGate {
+    fn default() -> Self {
+        Self {
+            resolved: false,
+            logged_failure: false,
+            tx: None,
+        }
+    }
+}
+
+impl StartGate {
+    fn new(tx: oneshot::Sender<Result<(), String>>) -> Self {
+        Self {
+            resolved: false,
+            logged_failure: false,
+            tx: Some(tx),
+        }
+    }
+
+    fn first_event(&mut self) {
+        if self.resolved {
+            return;
+        }
+        self.resolved = true;
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Ok(()));
+        }
+    }
+
+    fn failed(&mut self, detail: String) {
+        if self.resolved {
+            return;
+        }
+        self.resolved = true;
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Err(detail));
+        }
+    }
+}
+
 /// Buffer a Responses SSE stream for a non-streaming downstream request.
 /// The upstream response is retained only until its terminal `response.completed`
 /// event, which is then normalized by the caller into a ChatCompletion JSON body.
 pub async fn collect_responses_chat_completion(
     response: reqwest::Response,
+    model: &str,
 ) -> Result<Value, String> {
-    collect_responses_completion(response).await
+    collect_responses_completion(response, model).await
 }
 
 fn now_timestamp() -> u64 {
@@ -82,7 +191,10 @@ fn response_text_delta(value: &Value) -> Option<&str> {
         .flatten()
 }
 
-pub async fn collect_responses_completion(response: reqwest::Response) -> Result<Value, String> {
+pub async fn collect_responses_completion(
+    response: reqwest::Response,
+    model: &str,
+) -> Result<Value, String> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     let mut aggregate_bytes = 0usize;
@@ -115,7 +227,14 @@ pub async fn collect_responses_completion(response: reqwest::Response) -> Result
                     return Ok(completed);
                 }
                 Some("response.failed") | Some("response.incomplete") | Some("error") => {
-                    return Err("upstream Responses request failed or was incomplete".into())
+                    let detail = responses_failure_detail(&value);
+                    log_upstream_stream_failure(
+                        model,
+                        &detail,
+                        Some(&value),
+                        OutputProtocol::Chat,
+                    );
+                    return Err(detail);
                 }
                 Some(_) => {}
                 None => return Err("malformed upstream Responses event missing type".into()),
@@ -125,7 +244,7 @@ pub async fn collect_responses_completion(response: reqwest::Response) -> Result
     Err("upstream Responses stream ended without response.completed".into())
 }
 
-pub fn translate(
+pub async fn translate(
     response: reqwest::Response,
     protocol: Protocol,
     output_protocol: OutputProtocol,
@@ -133,7 +252,7 @@ pub fn translate(
     include_usage: bool,
     idle_timeout_seconds: Option<f64>,
     total_timeout_seconds: Option<f64>,
-) -> Translation {
+) -> Result<Translation, String> {
     let status = response.status();
     let content_type = response
         .headers()
@@ -143,6 +262,10 @@ pub fn translate(
         .to_ascii_lowercase();
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let (usage_tx, usage_rx) = oneshot::channel();
+    let (gate_tx, gate_rx) = oneshot::channel::<Result<(), String>>();
+    let gate = Arc::new(Mutex::new(StartGate::new(gate_tx)));
+    let task_gate = gate.clone();
+    let task_model = model.clone();
     tokio::spawn(async move {
         let options = TranslationOptions {
             include_usage,
@@ -155,15 +278,35 @@ pub fn translate(
             response,
             protocol,
             output_protocol,
-            &model,
+            &task_model,
             &content_type,
             &tx,
             options,
+            task_gate.clone(),
         )
         .await;
         let usage = match result {
-            Ok(usage) => usage,
+            Ok(usage) => {
+                if let Ok(mut gate) = task_gate.lock() {
+                    gate.first_event();
+                }
+                usage
+            }
             Err(error) => {
+                let report_early_failure = match task_gate.lock() {
+                    Ok(mut gate) => {
+                        // A failure before the first upstream event is the case
+                        // the caller can still fail over. It is only logged here
+                        // when no specific upstream event was already reported.
+                        let report = !gate.resolved && !gate.logged_failure;
+                        gate.failed(error.clone());
+                        report
+                    }
+                    Err(_) => false,
+                };
+                if report_early_failure {
+                    log_upstream_stream_failure(&task_model, &error, None, output_protocol);
+                }
                 let payload = match output_protocol {
                     OutputProtocol::Chat => json!({"error":{"message":error}}),
                     OutputProtocol::Responses => json!({
@@ -183,6 +326,15 @@ pub fn translate(
         }
         let _ = usage_tx.send(usage);
     });
+    // Do not commit a 200 to the client until the upstream produced its first
+    // valid event. Nothing user-visible has been written before that point, so
+    // an early upstream failure can still fail over to the next same-tier
+    // provider instead of surfacing a broken stream.
+    match gate_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(detail)) => return Err(detail),
+        Err(_) => return Err("upstream stream ended before its first event".into()),
+    }
     let mut output = Response::new(Body::from_stream(ReceiverStream::new(rx)));
     *output.status_mut() = status;
     output.headers_mut().insert(
@@ -193,10 +345,10 @@ pub fn translate(
         "cache-control",
         HeaderValue::from_static("no-cache, no-transform"),
     );
-    Translation {
+    Ok(Translation {
         response: output,
         usage: usage_rx,
-    }
+    })
 }
 
 async fn run_translation(
@@ -207,8 +359,10 @@ async fn run_translation(
     content_type: &str,
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     options: TranslationOptions,
+    gate: Arc<Mutex<StartGate>>,
 ) -> Result<(i64, i64, i64), String> {
     let mut state = StreamState::new_with_options(model, output_protocol, options.include_usage);
+    state.gate = gate;
     let timeouts = options.timeouts;
     for event in state.start_chunks() {
         send_wire(tx, &event, output_protocol).await?;
@@ -290,7 +444,7 @@ async fn run_translation(
 fn validate_responses_event(value: &Value) -> Result<(), String> {
     match value.get("type").and_then(Value::as_str) {
         Some("response.failed") | Some("response.incomplete") | Some("error") => {
-            Err("upstream Responses request failed or was incomplete".into())
+            Err(responses_failure_detail(value))
         }
         Some(_) => Ok(()),
         None => Err("malformed upstream Responses event missing type".into()),
@@ -420,7 +574,18 @@ async fn process_json_bytes(
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("decode upstream stream event: {error}"))?;
     if protocol == Protocol::Responses {
-        validate_responses_event(&value)?;
+        if let Err(detail) = validate_responses_event(&value) {
+            if let Ok(mut gate) = state.gate.lock() {
+                gate.logged_failure = true;
+            }
+            log_upstream_stream_failure(
+                &state.model,
+                &detail,
+                Some(&value),
+                state.output_protocol,
+            );
+            return Err(detail);
+        }
         if value.get("type").and_then(Value::as_str) == Some("response.completed") {
             state.responses.completed = true;
         }
@@ -428,6 +593,9 @@ async fn process_json_bytes(
     let chunks = state.convert(protocol, &value);
     for chunk in chunks {
         send_wire(tx, &chunk, state.output_protocol).await?;
+    }
+    if let Ok(mut gate) = state.gate.lock() {
+        gate.first_event();
     }
     Ok(())
 }
@@ -526,6 +694,7 @@ struct StreamState {
     output_protocol: OutputProtocol,
     include_usage: bool,
     responses: ResponsesOutputState,
+    gate: Arc<Mutex<StartGate>>,
 }
 
 impl StreamState {
@@ -548,6 +717,7 @@ impl StreamState {
             output_protocol,
             include_usage,
             responses: ResponsesOutputState::new(model, created),
+            gate: Arc::new(Mutex::new(StartGate::default())),
         }
     }
 
@@ -1886,5 +2056,81 @@ mod tests {
             serde_json::from_slice::<Value>(&frames[1]).unwrap(),
             json!({"b":{"c":2}})
         );
+    }
+
+    #[test]
+    fn responses_failure_detail_reports_upstream_error_metadata() {
+        let detail = responses_failure_detail(&json!({
+            "type":"response.failed",
+            "response":{"error":{"code":"rate_limit_exceeded","type":"usage_limit","message":"limit reached"}}
+        }));
+        assert!(detail.starts_with("upstream Responses request failed or was incomplete"), "{detail}");
+        assert!(detail.contains("type=usage_limit"), "{detail}");
+        assert!(detail.contains("code=rate_limit_exceeded"), "{detail}");
+        assert!(detail.contains("message=limit reached"), "{detail}");
+    }
+
+    #[test]
+    fn responses_failure_detail_reports_incomplete_reason() {
+        let detail = responses_failure_detail(&json!({
+            "type":"response.incomplete",
+            "response":{"incomplete_details":{"reason":"max_output_tokens"}}
+        }));
+        assert!(detail.contains("response.incomplete"), "{detail}");
+        assert!(detail.contains("reason=max_output_tokens"), "{detail}");
+    }
+
+    #[test]
+    fn responses_failure_detail_never_reads_generated_content() {
+        let detail = responses_failure_detail(&json!({
+            "type":"error",
+            "error":{"code":"server_error","message":"boom"},
+            "output":[{"content":[{"text":"SECRET-PROMPT-ECHO"}]}]
+        }));
+        assert!(!detail.contains("SECRET-PROMPT-ECHO"), "{detail}");
+    }
+
+    #[test]
+    fn bounded_log_field_truncates_and_strips_newlines() {
+        let value = bounded_log_field("line one\nline two", 9);
+        assert_eq!(value.chars().count(), 9);
+        assert!(!value.contains('\n'));
+    }
+
+    #[test]
+    fn start_gate_resolves_once_for_the_first_outcome() {
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        let mut gate = StartGate::new(tx);
+        gate.first_event();
+        gate.failed("later failure".into());
+        assert!(gate.resolved);
+        assert_eq!(rx.blocking_recv().unwrap(), Ok(()));
+
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        let mut gate = StartGate::new(tx);
+        gate.failed("early failure".into());
+        gate.first_event();
+        assert_eq!(
+            rx.blocking_recv().unwrap(),
+            Err("early failure".to_string())
+        );
+    }
+
+    #[test]
+    fn start_gate_tracks_an_already_logged_upstream_failure() {
+        let (tx, _rx) = oneshot::channel::<Result<(), String>>();
+        let mut gate = StartGate::new(tx);
+        assert!(!gate.logged_failure);
+        gate.logged_failure = true;
+        assert!(gate.logged_failure && !gate.resolved);
+    }
+
+    #[test]
+    fn start_gate_without_channel_is_inert() {
+        let mut gate = StartGate::default();
+        gate.first_event();
+        gate.failed("ignored".into());
+        assert!(gate.resolved);
+        assert!(gate.tx.is_none());
     }
 }

@@ -19,7 +19,7 @@ use url::Url;
 
 use crate::persistence::{ChannelStat, RequestStat};
 use crate::provider_stream::{
-    self, OutputProtocol as StreamOutputProtocol, Protocol as StreamProtocol,
+    self, bounded_log_field, OutputProtocol as StreamOutputProtocol, Protocol as StreamProtocol,
 };
 use crate::proxy::{
     filtered_response_headers, json_error, read_spooled_body, AppState, RequestBodySpoolError,
@@ -371,6 +371,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             &prepared.url,
             "started",
             None,
+            None,
         );
         match send_attempt(&state, &provider, prepared, &headers, &path).await {
             Ok(success) => {
@@ -433,6 +434,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                     &success.upstream_url,
                     "completed",
                     Some(success.status.as_u16()),
+                    None,
                 );
                 return success.response;
             }
@@ -494,6 +496,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                     &failure.upstream_url,
                     "failed",
                     Some(failure.status.as_u16()),
+                    Some(&failure.detail),
                 );
                 if !policy.retryable {
                     break;
@@ -2050,8 +2053,11 @@ async fn send_attempt(
     }
     if prepared.upstream_stream && !prepared.downstream_stream
         && prepared.adapter == ResponseAdapter::ResponsesToChat {
-        let response_value = provider_stream::collect_responses_chat_completion(response)
-            .await
+        let response_value = provider_stream::collect_responses_chat_completion(
+            response,
+            &prepared.original_model,
+        )
+        .await
             .map_err(|detail| AttemptFailure {
             status: StatusCode::BAD_GATEWAY,
             detail,
@@ -2101,7 +2107,17 @@ async fn send_attempt(
             prepared.chat_stream_include_usage,
             timeouts.idle,
             timeouts.total,
-        );
+        )
+        .await
+        .map_err(|detail| AttemptFailure {
+            // The upstream stream failed before producing its first event, so
+            // nothing was sent downstream yet and the caller may still fail
+            // over to the next same-tier provider.
+            status: StatusCode::BAD_GATEWAY,
+            detail,
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?;
         translation
             .response
             .headers_mut()
@@ -5123,6 +5139,7 @@ fn emit_attempt(
     url: &str,
     outcome: &str,
     status: Option<u16>,
+    detail: Option<&str>,
 ) {
     let upstream_host = Url::parse(url)
         .ok()
@@ -5142,6 +5159,9 @@ fn emit_attempt(
             "upstream_host":upstream_host,
             "outcome":outcome,
             "status_code":status,
+            // Upstream rejection reason. Bounded, single-line and metadata only:
+            // one attempt stays one log record and no prompt content is included.
+            "detail":detail.map(|value| bounded_log_field(value, 400)),
         })
     );
 }
