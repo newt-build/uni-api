@@ -421,15 +421,21 @@ async fn provider_usage_response(state: &AppState, headers: &HeaderMap) -> Respo
         Ok(client) => client,
         Err(_) => return unavailable("transport_unavailable"),
     };
-    let mut request = client
-        .get("https://chatgpt.com/backend-api/wham/usage")
-        .bearer_auth(auth.bearer)
-        .header("accept", "application/json")
-        .timeout(Duration::from_secs(30));
-    if let Some(account_id) = auth.account_id {
-        request = request.header("chatgpt-account-id", account_id);
-    }
-    let response = match request.send().await {
+    let authenticated_get = |url: &'static str| {
+        let mut request = client
+            .get(url)
+            .bearer_auth(&auth.bearer)
+            .header("accept", "application/json")
+            .timeout(Duration::from_secs(30));
+        if let Some(account_id) = auth.account_id.as_deref() {
+            request = request.header("chatgpt-account-id", account_id);
+        }
+        request
+    };
+    let response = match authenticated_get("https://chatgpt.com/backend-api/wham/usage")
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(_) => return unavailable("transport_error"),
     };
@@ -449,6 +455,18 @@ async fn provider_usage_response(state: &AppState, headers: &HeaderMap) -> Respo
     if windows.is_empty() {
         return unavailable("upstream_payload_unsupported");
     }
+    let reset_credits =
+        match authenticated_get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|payload| normalize_reset_credits(&payload)),
+            _ => None,
+        };
     json_response(
         StatusCode::OK,
         json!({"subscriptions":[{
@@ -457,6 +475,7 @@ async fn provider_usage_response(state: &AppState, headers: &HeaderMap) -> Respo
             "observed_at":observed_at,
             "fresh_until":observed_at.saturating_add(300),
             "windows":windows,
+            "reset_credits":reset_credits,
         }]}),
     )
 }
@@ -464,13 +483,11 @@ async fn provider_usage_response(state: &AppState, headers: &HeaderMap) -> Respo
 fn normalize_codex_usage(payload: &Value) -> Vec<Value> {
     let mut windows = Vec::new();
     if let Some(rate_limit) = payload.get("rate_limit").and_then(Value::as_object) {
-        for (source_key, window) in [
-            ("primary_window", "rolling"),
-            ("secondary_window", "weekly"),
-        ] {
+        for source_key in ["primary_window", "secondary_window"] {
             let Some(value) = rate_limit.get(source_key).and_then(Value::as_object) else {
                 continue;
             };
+            let window = codex_window_kind(source_key, value);
             let used_percent = value
                 .get("used_percent")
                 .or_else(|| value.get("percent"))
@@ -517,6 +534,56 @@ fn normalize_codex_usage(payload: &Value) -> Vec<Value> {
         }
     }
     windows
+}
+
+fn codex_window_kind(source_key: &str, value: &serde_json::Map<String, Value>) -> &'static str {
+    let minutes = value
+        .get("window_duration_mins")
+        .or_else(|| value.get("windowDurationMins"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get("limit_window_seconds")
+                .or_else(|| value.get("window_duration_seconds"))
+                .and_then(Value::as_u64)
+                .map(|seconds| seconds.saturating_add(59) / 60)
+        });
+    match minutes {
+        Some(1..=360) => "5h",
+        Some(361..=11_520) => "weekly",
+        Some(11_521..=50_400) => "monthly",
+        Some(_) => "unknown",
+        None if source_key == "primary_window" => "weekly",
+        None if source_key == "secondary_window" => "monthly",
+        None => "unknown",
+    }
+}
+
+fn normalize_reset_credits(payload: &Value) -> Option<Value> {
+    let root = payload
+        .get("rate_limit_reset_credits")
+        .or_else(|| payload.get("rateLimitResetCredits"))
+        .unwrap_or(payload);
+    let available_count = root
+        .get("available_count")
+        .or_else(|| root.get("availableCount"))
+        .and_then(Value::as_u64);
+    let expiries = root
+        .get("credits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|credit| {
+            credit
+                .get("expires_at")
+                .or_else(|| credit.get("expiresAt"))
+                .filter(|value| value.is_number() || value.is_string())
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    let count =
+        available_count.or_else(|| (!expiries.is_empty()).then_some(expiries.len() as u64))?;
+    Some(json!({"available_count":count,"expires_at":expiries}))
 }
 
 async fn channel_rankings_response(
@@ -787,15 +854,15 @@ mod tests {
             "plan_type":"plus",
             "access_token":"must-not-escape",
             "rate_limit":{
-                "primary_window":{"used_percent":42,"reset_at":1_700_000_000,"raw":"hidden"},
-                "secondary_window":{"used_percent":7,"reset_at":"2026-09-22T00:00:00Z"}
+                "primary_window":{"used_percent":42,"reset_at":1_700_000_000,"limit_window_seconds":604800,"raw":"hidden"},
+                "secondary_window":{"used_percent":7,"reset_at":"2026-10-15T00:00:00Z","limit_window_seconds":2592000}
             }
         }));
         assert_eq!(
             windows,
             vec![
-                json!({"window":"rolling","used_percent":42,"reset_at":1_700_000_000}),
-                json!({"window":"weekly","used_percent":7,"reset_at":"2026-09-22T00:00:00Z"}),
+                json!({"window":"weekly","used_percent":42,"reset_at":1_700_000_000}),
+                json!({"window":"monthly","used_percent":7,"reset_at":"2026-10-15T00:00:00Z"}),
             ]
         );
         let encoded = serde_json::to_string(&windows).unwrap();
@@ -808,5 +875,23 @@ mod tests {
     fn unsupported_codex_usage_fails_closed() {
         assert!(normalize_codex_usage(&json!({"usage":{"rolling":{}}})).is_empty());
         assert!(normalize_codex_usage(&json!({"token":"secret"})).is_empty());
+    }
+
+    #[test]
+    fn reset_credits_expose_only_count_and_expiries() {
+        let normalized = normalize_reset_credits(&json!({
+            "available_count":3,
+            "credits":[
+                {"id":"secret-id-1","expires_at":1_790_000_000,"description":"hidden"},
+                {"id":"secret-id-2","expires_at":1_800_000_000},
+                {"id":"secret-id-3","expires_at":1_810_000_000}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(normalized["available_count"], 3);
+        assert_eq!(normalized["expires_at"].as_array().unwrap().len(), 3);
+        let encoded = normalized.to_string();
+        assert!(!encoded.contains("secret-id"));
+        assert!(!encoded.contains("description"));
     }
 }
