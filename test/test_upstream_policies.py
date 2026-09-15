@@ -30,6 +30,23 @@ def test_provider_error_classifier_normalizes_http_and_network_errors():
     assert classifier.remap_status_code(500, "string_above_max_length") == 413
 
 
+def test_nginx_html_413_is_retryable_as_same_tier_gateway_failure():
+    classifier = ProviderErrorClassifier(_safe_get)
+    retry_policy = RetryPolicy(classifier, _get_engine)
+    nginx_error = "<html><head><title>413 Request Entity Too Large</title></head></html>"
+
+    # The edge's HTML response is not a local UniApi body rejection. Normalize
+    # it to a retryable gateway outcome so the resolved semantic tier can try
+    # its next same-tier provider.
+    assert classifier.remap_status_code(413, nginx_error) == 429
+    assert retry_policy.should_retry(
+        True,
+        classifier.remap_status_code(413, nginx_error),
+        {"base_url": "https://provider.example/v1/chat/completions"},
+        error_message=nginx_error,
+    ) is True
+
+
 @pytest.mark.parametrize(
     ("error_type", "kind", "owner", "phase", "status_code", "penalty"),
     [
@@ -244,6 +261,44 @@ def test_provider_error_classifier_remaps_model_pricing_400_for_failover(details
         {"base_url": "https://provider.example/v1/messages"},
         error_message=str(details),
     ) is True
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        "Endpoint is unavailable",
+        {"error": {"type": "upstream_error", "message": "Endpoint is unavailable"}},
+        {"detail": {"code": "endpoint_unavailable", "message": "Endpoint is unavailable for this provider"}},
+    ],
+)
+def test_provider_endpoint_unavailable_400_retries_same_tier(details):
+    classifier = ProviderErrorClassifier(_safe_get)
+    retry_policy = RetryPolicy(classifier, _get_engine)
+
+    assert classifier.is_provider_endpoint_unavailable_error(400, details) is True
+    assert classifier.remap_status_code(400, str(details)) == 502
+    assert retry_policy.should_retry(
+        True,
+        400,
+        {"base_url": "https://provider.example/v1/responses"},
+        error_message=str(details),
+    ) is True
+
+
+def test_provider_endpoint_unavailable_phrase_is_narrow():
+    classifier = ProviderErrorClassifier(_safe_get)
+    retry_policy = RetryPolicy(classifier, _get_engine)
+    details = {"error": {"type": "invalid_request_error", "message": "Endpoint is invalid"}}
+
+    assert classifier.is_provider_endpoint_unavailable_error(400, details) is False
+    assert classifier.is_provider_endpoint_unavailable_error(503, "Endpoint is unavailable") is False
+    assert classifier.remap_status_code(400, str(details)) == 400
+    assert retry_policy.should_retry(
+        True,
+        400,
+        {"base_url": "https://provider.example/v1/responses"},
+        error_message=str(details),
+    ) is False
 
 
 def test_provider_error_classifier_keeps_real_bad_request_non_retryable():

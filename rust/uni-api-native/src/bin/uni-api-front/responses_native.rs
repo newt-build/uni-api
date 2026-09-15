@@ -2902,6 +2902,12 @@ fn build_headers(
         ("x-caller-request-id".into(), request_id.to_owned()),
         ("x-caller-app".into(), "uni-api-ember".into()),
     ]);
+    if provider.base_url.contains("opencode.ai") {
+        headers.insert(
+            "x-opencode-session".into(),
+            header_or(incoming, "x-opencode-session", request_id),
+        );
+    }
     if engine == "codex" {
         headers.insert(
             "Openai-Beta".into(),
@@ -3330,7 +3336,11 @@ fn remap_provider_status(status: u16, detail: &str) -> u16 {
     }
     if detail.contains("<center><h1>400 Bad Request</h1></center>")
         || detail.contains("Provider API error: bad response status code 400")
-        || status == 400 && is_model_pricing_unconfigured(detail)
+        || status == 400
+            && (is_model_pricing_unconfigured(detail)
+                || detail
+                    .to_ascii_lowercase()
+                    .contains("endpoint is unavailable"))
     {
         return 502;
     }
@@ -4043,6 +4053,8 @@ mod tests {
             ),
             502
         );
+        assert_eq!(remap_provider_status(400, "Endpoint is unavailable"), 502);
+        assert_eq!(remap_provider_status(400, "Endpoint is invalid"), 400);
         assert!(is_missing_persisted_item_error(
             r#"{"error":{"type":"invalid_request_error","message":"Item with id 'rs_1' not found. Items are not persisted when store is false."}}"#,
         ));
@@ -4239,9 +4251,3 @@ mod tests {
         assert!(route.final_emitted);
     }
 }
-    if provider.base_url.contains("opencode.ai") {
-        headers.insert(
-            "x-opencode-session".into(),
-            header_or(incoming, "x-opencode-session", request_id),
-        );
-    }

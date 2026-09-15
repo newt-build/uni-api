@@ -186,6 +186,12 @@ class ProviderErrorClassifier:
             # Treat that provider response as a bad gateway response so the
             # routing layer can fail over to another channel.
             return 502
+        if self.is_provider_endpoint_unavailable_error(status_code, error_message):
+            # Some OpenAI-compatible gateways report a provider/channel outage
+            # as HTTP 400.  This is not a caller error: remap it so the resolved
+            # semantic tier can use its next same-tier channel and the failing
+            # provider key can enter its configured cooldown.
+            return 502
         if "The response was filtered due to the prompt triggering Azure OpenAI's content management policy." in error_message:
             return 403
         if "<head><title>413 Request Entity Too Large</title></head>" in error_message:
@@ -223,6 +229,21 @@ class ProviderErrorClassifier:
         # do not broaden the match to every "model unavailable" response.
         compact = re.sub(r"\s+", "", haystack)
         return "价格尚未由管理员配置" in compact
+
+    def is_provider_endpoint_unavailable_error(
+        self,
+        status_code: int,
+        details: Any,
+    ) -> bool:
+        """Recognize the narrow upstream-availability error misreported as 400."""
+
+        if status_code != 400:
+            return False
+        code, error_type, message, raw = self.details_parts(details)
+        haystack = " ".join(
+            part for part in (code, error_type, message, raw) if part
+        ).casefold()
+        return "endpoint is unavailable" in haystack
 
     def is_retryable_rate_limit_error(self, status_code: int, details: Any) -> bool:
         if status_code != 429:
@@ -360,6 +381,11 @@ class RetryPolicy:
         if not auto_retry:
             return False
         if self.classifier.is_model_pricing_unconfigured_error(
+            status_code,
+            error_message,
+        ):
+            return True
+        if self.classifier.is_provider_endpoint_unavailable_error(
             status_code,
             error_message,
         ):
